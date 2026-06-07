@@ -13,8 +13,12 @@ from dotenv import load_dotenv
 load_dotenv()
 api_key = os.getenv("OPENROUTER_API_KEY")
 
-QWEN_MODEL = "qwen/qwen-2.5-vl-72b-instruct"
-QWEN_BASE_URL = "https://openrouter.ai/api/v1"
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+MODELS = {
+    "Gemini 3 Flash": "google/gemini-3-flash-preview",
+    "Qwen 2.5 VL": "qwen/qwen-2.5-vl-72b-instruct",
+}
 
 # App setup
 st.set_page_config(page_title="Industrial Tire OCR Dashboard", layout="wide")
@@ -24,7 +28,9 @@ st.markdown("Automated batch sidewall character extraction pipeline.")
 
 # Sidebar
 st.sidebar.header("Model Settings")
-st.sidebar.info(f"Using **Qwen** model: `{QWEN_MODEL}`")
+selected_model_name = st.sidebar.selectbox("Select Model", list(MODELS.keys()), index=0)
+active_model = MODELS[selected_model_name]
+st.sidebar.info(f"Active ID: `{active_model}`")
 temperature = st.sidebar.slider("Temperature", 0.0, 1.0, 0.0, 0.05)
 max_tokens = st.sidebar.number_input(
     "Max Tokens", min_value=20, max_value=500, value=300
@@ -39,13 +45,16 @@ SYSTEM_PROMPT = (
 
 UPGRADED_PROMPT = (
     "Perform precise industrial OCR tracking on this tyre sidewall rubber. "
-    "Locate the primary MOLDED raised rubber alphanumeric sizing sequence code. "
+    "Locate TWO pieces of information: "
+    "1. The primary MOLDED raised rubber alphanumeric sizing sequence code. "
+    "2. The DOT (Department of Transportation) number — the full sequence starting with 'DOT' "
+    "including all alphanumeric segments and ending with the 4-digit manufacturing date code. "
     "CRITICAL: Completely ignore any high-contrast white factory ink stamps, laser prints, or paint labels. "
     "Look strictly for the permanent structural text molded into the dark black rubber texture. "
+    "Read the ACTUAL characters from the image. Do NOT guess or use example values. "
     "Respond with ONLY this exact JSON format, no other text: "
-    '{"extracted_size": "THE_SIZE_STRING_HERE"} '
-    "If you cannot read the size, respond with: "
-    '{"extracted_size": null}'
+    '{"extracted_size": "<SIZE_FROM_IMAGE>", "extracted_dot": "<DOT_FROM_IMAGE>"} '
+    "If you cannot read a value, set it to null."
 )
 
 # Size patterns for extraction fallback
@@ -57,6 +66,31 @@ TYRE_SIZE_PATTERNS = [
     # Generic fallback (e.g. 35X12.50)
     re.compile(r"\d{2,3}[/x]\d{2,3}(?:\.\d{1,2})?", re.IGNORECASE),
 ]
+
+# DOT number patterns for extraction fallback
+DOT_NUMBER_PATTERNS = [
+    # Full DOT: DOT XXXX XXXX XXXX WWYY
+    re.compile(r"DOT\s*[A-Z0-9]{2,4}\s*[A-Z0-9]{2,4}\s*[A-Z0-9]{2,4}\s*\d{4}", re.IGNORECASE),
+    # DOT with varying segment lengths
+    re.compile(r"DOT\s*[A-Z0-9\s]{4,16}\s*\d{4}", re.IGNORECASE),
+    # Just DOT followed by content
+    re.compile(r"DOT\s+[A-Z0-9\s]{6,}", re.IGNORECASE),
+]
+
+
+def decode_dot_date(dot_string):
+    """Decode manufacturing date from DOT number's last 4 digits (WWYY format)."""
+    if not dot_string:
+        return None
+    clean = dot_string.replace(" ", "")
+    digits = re.search(r"(\d{4})$", clean)
+    if digits:
+        ww = int(digits.group(1)[:2])
+        yy = int(digits.group(1)[2:])
+        year = 2000 + yy
+        if 1 <= ww <= 53:
+            return f"Week {ww}, {year}"
+    return None
 
 
 def encode_image_to_base64(uploaded_file):
@@ -95,7 +129,7 @@ def format_error_message(e):
         )
     elif "404" in error_str or "not found" in error_str.lower():
         return (
-            f"**Model Not Found** — The model `{QWEN_MODEL}` was not found. "
+            f"**Model Not Found** — The model `{active_model}` was not found. "
             "Please check the model name or your endpoint settings."
         )
     elif "timeout" in error_str.lower() or "connection" in error_str.lower():
@@ -107,51 +141,56 @@ def format_error_message(e):
         return f"**Extraction Failed** — {error_str[:200]}"
 
 
+def _try_parse_json(json_str):
+    """Try to parse JSON and extract size + DOT fields."""
+    try:
+        data = json.loads(json_str)
+        return data.get("extracted_size"), data.get("extracted_dot"), True
+    except (json.JSONDecodeError, AttributeError):
+        return None, None, False
+
+
+def _rescue_truncated_json(json_str):
+    """Attempt to fix and parse truncated JSON."""
+    rescued = json_str
+    if rescued.count('"') % 2 != 0:
+        rescued += '"'
+    if not rescued.endswith("}"):
+        rescued += "}"
+    return _try_parse_json(rescued)
+
+
 def parse_extraction_result(content):
     # Parse LLM response using json or pattern match
+    # Returns (size_result, dot_result, warning)
     if not content or not content.strip():
-        return None, "Empty response from model"
+        return None, None, "Empty response from model"
 
     content = content.strip()
 
     # Fix truncated responses
     if content.startswith("{") and not content.endswith("}"):
-        rescued_content = content
-        # If it ends inside a string key/value, close the quote
-        if rescued_content.count('"') % 2 != 0:
-            rescued_content += '"'
-        # Close the curly brace
-        rescued_content += "}"
-        try:
-            val = json.loads(rescued_content).get("extracted_size")
-            if val:
-                return val, f"Rescued truncated JSON (raw: {content})"
-        except json.JSONDecodeError:
-            pass
+        size, dot, ok = _rescue_truncated_json(content)
+        if ok and (size or dot):
+            return size, dot, f"Rescued truncated JSON (raw: {content})"
 
     # JSON parse
-    try:
-        return json.loads(content).get("extracted_size"), None
-    except json.JSONDecodeError:
-        pass
+    size, dot, ok = _try_parse_json(content)
+    if ok:
+        return size, dot, None
 
     # Markdown code blocks
     try:
         if "```json" in content:
             json_str = content.split("```json")[1].split("```")[0].strip()
-            # If the markdown block is truncated, try to close quotes/braces
-            if json_str.count('"') % 2 != 0:
-                json_str += '"'
-            if not json_str.endswith("}"):
-                json_str += "}"
-            return json.loads(json_str).get("extracted_size"), None
+            size, dot, ok = _rescue_truncated_json(json_str)
+            if ok:
+                return size, dot, None
         elif "```" in content:
             json_str = content.split("```")[1].split("```")[0].strip()
-            if json_str.count('"') % 2 != 0:
-                json_str += '"'
-            if not json_str.endswith("}"):
-                json_str += "}"
-            return json.loads(json_str).get("extracted_size"), None
+            size, dot, ok = _rescue_truncated_json(json_str)
+            if ok:
+                return size, dot, None
     except (json.JSONDecodeError, IndexError):
         pass
 
@@ -159,17 +198,32 @@ def parse_extraction_result(content):
     try:
         json_match = re.search(r"\{[^}]+\}", content)
         if json_match:
-            return json.loads(json_match.group()).get("extracted_size"), None
+            size, dot, ok = _try_parse_json(json_match.group())
+            if ok:
+                return size, dot, None
     except json.JSONDecodeError:
         pass
 
     # Fallback to regex patterns
+    size_result = None
+    dot_result = None
+
     for pattern in TYRE_SIZE_PATTERNS:
         match = pattern.search(content)
         if match:
-            return match.group(), f"Extracted via pattern match (raw: {content})"
+            size_result = match.group()
+            break
 
-    return None, f"Could not parse response: {repr(content)}"
+    for pattern in DOT_NUMBER_PATTERNS:
+        match = pattern.search(content)
+        if match:
+            dot_result = match.group()
+            break
+
+    if size_result or dot_result:
+        return size_result, dot_result, f"Extracted via pattern match (raw: {content})"
+
+    return None, None, f"Could not parse response: {repr(content)}"
 
 
 def run_ocr_extraction(client, b64_string, model, temp, tokens):
@@ -199,8 +253,8 @@ def run_ocr_extraction(client, b64_string, model, temp, tokens):
         ],
     )
     content = response.choices[0].message.content
-    result, warning = parse_extraction_result(content)
-    return result, warning, content
+    size_result, dot_result, warning = parse_extraction_result(content)
+    return size_result, dot_result, warning, content
 
 
 # Select scope
@@ -239,7 +293,7 @@ if run_mode == "Batch Processing (Multiple Images)":
                 status_text = st.empty()
 
                 batch_results = []
-                client = OpenAI(api_key=api_key, base_url=QWEN_BASE_URL)
+                client = OpenAI(api_key=api_key, base_url=OPENROUTER_BASE_URL)
                 total_start = time.time()
 
                 for idx, file in enumerate(uploaded_files):
@@ -250,18 +304,23 @@ if run_mode == "Batch Processing (Multiple Images)":
                     item_start = time.time()
                     try:
                         b64_string = encode_image_to_base64(file)
-                        result, warning, raw_content = run_ocr_extraction(
-                            client, b64_string, QWEN_MODEL, temperature, max_tokens
+                        size_result, dot_result, warning, raw_content = run_ocr_extraction(
+                            client, b64_string, active_model, temperature, max_tokens
                         )
                         elapsed = round(time.time() - item_start, 2)
 
+                        dot_date = decode_dot_date(dot_result) if dot_result else None
                         status = "OK" if not warning else f"WARNING: {warning[:60]}"
                         batch_results.append(
                             {
                                 "Filename": file.name,
-                                "Extracted Size": str(result).upper()
-                                if result
+                                "Extracted Size": str(size_result).upper()
+                                if size_result
                                 else "N/A",
+                                "DOT Number": str(dot_result).upper()
+                                if dot_result
+                                else "N/A",
+                                "Mfg Date": dot_date if dot_date else "N/A",
                                 "Status": status,
                                 "Time (s)": elapsed,
                             }
@@ -273,6 +332,8 @@ if run_mode == "Batch Processing (Multiple Images)":
                             {
                                 "Filename": file.name,
                                 "Extracted Size": "N/A",
+                                "DOT Number": "N/A",
+                                "Mfg Date": "N/A",
                                 "Status": f"FAILED: {format_error_message(e)[:80]}",
                                 "Time (s)": elapsed,
                             }
@@ -334,25 +395,37 @@ else:
                         try:
                             client = OpenAI(
                                 api_key=api_key,
-                                base_url=QWEN_BASE_URL,
+                                base_url=OPENROUTER_BASE_URL,
                             )
                             b64_string = encode_image_to_base64(uploaded_file)
 
                             start_time = time.time()
-                            result, warning, raw_content = run_ocr_extraction(
+                            size_result, dot_result, warning, raw_content = run_ocr_extraction(
                                 client,
                                 b64_string,
-                                QWEN_MODEL,
+                                active_model,
                                 temperature,
                                 max_tokens,
                             )
                             elapsed = round(time.time() - start_time, 2)
 
-                            st.metric(
-                                "Extracted Tyre Size",
-                                str(result).upper() if result else "N/A",
-                            )
-                            st.metric("Response Time", f"{elapsed}s")
+                            dot_date = decode_dot_date(dot_result) if dot_result else None
+
+                            res_col1, res_col2 = st.columns(2)
+                            with res_col1:
+                                st.metric(
+                                    "Extracted Tyre Size",
+                                    str(size_result).upper() if size_result else "N/A",
+                                )
+                                st.metric("Response Time", f"{elapsed}s")
+                            with res_col2:
+                                dot_display = str(dot_result).upper() if dot_result else "N/A"
+                                st.markdown("**DOT Number**")
+                                st.code(dot_display, language=None)
+                                st.metric(
+                                    "Manufacturing Date",
+                                    dot_date if dot_date else "N/A",
+                                )
                             if warning:
                                 st.warning(f"Parse note: {warning}")
 
