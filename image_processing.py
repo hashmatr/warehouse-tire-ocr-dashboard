@@ -4,21 +4,25 @@ import json
 import re
 import time
 import os
+import html
 import pandas as pd
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter
 from io import BytesIO
-from openai import OpenAI
+import google.generativeai as genai
+
 from dotenv import load_dotenv
 
 load_dotenv()
-api_key = os.getenv("OPENROUTER_API_KEY")
+api_key = None
+try:
+    api_key = st.secrets["GEMINI_API_KEY"]
+except Exception:
+    api_key = os.getenv("GEMINI_API_KEY")
 
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+if api_key:
+    genai.configure(api_key=api_key)
 
-MODELS = {
-    "Gemini 3 Flash": "google/gemini-3-flash-preview",
-    "Qwen 2.5 VL": "qwen/qwen-2.5-vl-72b-instruct",
-}
+GEMINI_MODEL = "gemini-2.5-flash"
 
 # App setup
 st.set_page_config(page_title="Industrial Tire OCR Dashboard", layout="wide")
@@ -28,13 +32,9 @@ st.markdown("Automated batch sidewall character extraction pipeline.")
 
 # Sidebar
 st.sidebar.header("Model Settings")
-selected_model_name = st.sidebar.selectbox("Select Model", list(MODELS.keys()), index=0)
-active_model = MODELS[selected_model_name]
-st.sidebar.info(f"Active ID: `{active_model}`")
-temperature = st.sidebar.slider("Temperature", 0.0, 1.0, 0.0, 0.05)
-max_tokens = st.sidebar.number_input(
-    "Max Tokens", min_value=20, max_value=500, value=300
-)
+temperature = 0.0
+max_tokens = 1500
+
 
 # Engine prompts and patterns
 SYSTEM_PROMPT = (
@@ -43,19 +43,18 @@ SYSTEM_PROMPT = (
     "Your entire response must be a single valid JSON object and nothing else."
 )
 
-UPGRADED_PROMPT = (
-    "Perform precise industrial OCR tracking on this tyre sidewall rubber. "
-    "Locate TWO pieces of information: "
-    "1. The primary MOLDED raised rubber alphanumeric sizing sequence code. "
-    "2. The DOT (Department of Transportation) number — the full sequence starting with 'DOT' "
-    "including all alphanumeric segments and ending with the 4-digit manufacturing date code. "
-    "CRITICAL: Completely ignore any high-contrast white factory ink stamps, laser prints, or paint labels. "
-    "Look strictly for the permanent structural text molded into the dark black rubber texture. "
-    "Read the ACTUAL characters from the image. Do NOT guess or use example values. "
-    "Respond with ONLY this exact JSON format, no other text: "
-    '{"extracted_size": "<SIZE_FROM_IMAGE>", "extracted_dot": "<DOT_FROM_IMAGE>"} '
-    "If you cannot read a value, set it to null."
+OCR_PROMPT = (
+    "Extract the tyre size and DOT number molded into the rubber of this tyre sidewall.\n\n"
+    "Look for these two specific markings:\n"
+    "1. TYRE SIZE: The main molded sizing code (e.g., 285/75R18, 35x12.50R20, P245/75R17).\n"
+    "2. DOT NUMBER: The molded serial code located near the rim. "
+    "It ALWAYS starts with 'DOT ' and is followed by alphanumeric characters, ending with a 4-digit date code (WWYY). "
+    "Scan the entire circumference carefully. Do not stop reading early; extract the full sequence, including the 4-digit date code at the end.\n\n"
+    "Respond ONLY with a single JSON object in the following format, no other text or markdown:\n"
+    '{"extracted_size": "<SIZE_FROM_IMAGE>", "extracted_dot": "<DOT_FROM_IMAGE>"}\n'
+    "If a value is not found or is unreadable, set it to null."
 )
+
 
 # Size patterns for extraction fallback
 TYRE_SIZE_PATTERNS = [
@@ -70,7 +69,9 @@ TYRE_SIZE_PATTERNS = [
 # DOT number patterns for extraction fallback
 DOT_NUMBER_PATTERNS = [
     # Full DOT: DOT XXXX XXXX XXXX WWYY
-    re.compile(r"DOT\s*[A-Z0-9]{2,4}\s*[A-Z0-9]{2,4}\s*[A-Z0-9]{2,4}\s*\d{4}", re.IGNORECASE),
+    re.compile(
+        r"DOT\s*[A-Z0-9]{2,4}\s*[A-Z0-9]{2,4}\s*[A-Z0-9]{2,4}\s*\d{4}", re.IGNORECASE
+    ),
     # DOT with varying segment lengths
     re.compile(r"DOT\s*[A-Z0-9\s]{4,16}\s*\d{4}", re.IGNORECASE),
     # Just DOT followed by content
@@ -93,13 +94,37 @@ def decode_dot_date(dot_string):
     return None
 
 
-def encode_image_to_base64(uploaded_file):
-    # Convert image file to base64 JPEG
+def preprocess_image(image):
+    """Enhance image for better OCR: upscale, sharpen, boost contrast."""
+    # Upscale small images so the model can read fine text
+    w, h = image.size
+    min_dim = min(w, h)
+    if min_dim < 1500:
+        scale = 1500 / min_dim
+        new_w, new_h = int(w * scale), int(h * scale)
+        image = image.resize((new_w, new_h), Image.LANCZOS)
+
+    # Boost contrast to make molded rubber text stand out
+    image = ImageEnhance.Contrast(image).enhance(1.6)
+
+    # Sharpen to improve edge clarity of embossed characters
+    image = ImageEnhance.Sharpness(image).enhance(2.0)
+
+    # Slight brightness boost to reveal dark-on-dark text
+    image = ImageEnhance.Brightness(image).enhance(1.1)
+
+    return image
+
+
+def encode_image_to_base64(uploaded_file, enhance=True):
+    # Convert image file to base64 JPEG with optional preprocessing
     image = Image.open(uploaded_file)
-    if image.mode in ("RGBA", "P"):
+    if image.mode != "RGB":
         image = image.convert("RGB")
+    if enhance:
+        image = preprocess_image(image)
     buffered = BytesIO()
-    image.save(buffered, format="JPEG", quality=85)
+    image.save(buffered, format="JPEG", quality=95)
     return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
 
@@ -129,7 +154,7 @@ def format_error_message(e):
         )
     elif "404" in error_str or "not found" in error_str.lower():
         return (
-            f"**Model Not Found** — The model `{active_model}` was not found. "
+            f"**Model Not Found** — The model `{GEMINI_MODEL}` was not found. "
             "Please check the model name or your endpoint settings."
         )
     elif "timeout" in error_str.lower() or "connection" in error_str.lower():
@@ -226,35 +251,52 @@ def parse_extraction_result(content):
     return None, None, f"Could not parse response: {repr(content)}"
 
 
-def run_ocr_extraction(client, b64_string, model, temp, tokens):
-    # API call to extraction model
-    response = client.chat.completions.create(
-        model=model,
-        temperature=temp,
-        max_tokens=tokens,
-        messages=[
+def _call_gemini(prompt, image_bytes, temp, tokens):
+    """Single Gemini API call helper using Native JSON constraint."""
+    model = genai.GenerativeModel(
+        model_name=GEMINI_MODEL, system_instruction=SYSTEM_PROMPT
+    )
+    response = model.generate_content(
+        [
+            prompt,
             {
-                "role": "system",
-                "content": SYSTEM_PROMPT,
-            },
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": UPGRADED_PROMPT,
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{b64_string}"},
-                    },
-                ],
+                "mime_type": "image/jpeg",
+                "data": image_bytes,
             },
         ],
+        generation_config={
+            "temperature": temp,
+            "max_output_tokens": 1500,
+            "response_mime_type": "application/json",
+        },
     )
-    content = response.choices[0].message.content
+    return response.text if hasattr(response, "text") else ""
+
+
+def run_ocr_extraction(b64_string, temp, tokens):
+    """Perform single-pass OCR extraction for tyre size and DOT number."""
+    image_bytes = base64.b64decode(b64_string)
+
+    content = _call_gemini(OCR_PROMPT, image_bytes, temp, tokens)
     size_result, dot_result, warning = parse_extraction_result(content)
+
     return size_result, dot_result, warning, content
+
+
+def render_scrollable_value(label, value):
+    """Render a value with a horizontal scroller if the text is long."""
+    st.markdown(f"**{label}**")
+    if value and len(value) > 25:
+        escaped_value = html.escape(value)
+        st.markdown(
+            f'<div style="overflow-x:auto; white-space:nowrap; background:#0e1117; '
+            f"border:1px solid #333; border-radius:6px; padding:8px 12px; "
+            f'font-family:monospace; font-size:14px; color:#fafafa; max-width:100%;">'
+            f"{escaped_value}</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.code(value if value else "N/A", language=None)
 
 
 # Select scope
@@ -286,14 +328,13 @@ if run_mode == "Batch Processing (Multiple Images)":
         if st.button("Launch Batch Pipeline"):
             if not api_key:
                 st.warning(
-                    "Please provide a valid OpenRouter API Key in the .env file (OPENROUTER_API_KEY)."
+                    "Please provide a valid Gemini API Key in the .env file (GEMINI_API_KEY) or Streamlit secrets."
                 )
             else:
                 progress_bar = st.progress(0)
                 status_text = st.empty()
 
                 batch_results = []
-                client = OpenAI(api_key=api_key, base_url=OPENROUTER_BASE_URL)
                 total_start = time.time()
 
                 for idx, file in enumerate(uploaded_files):
@@ -304,22 +345,22 @@ if run_mode == "Batch Processing (Multiple Images)":
                     item_start = time.time()
                     try:
                         b64_string = encode_image_to_base64(file)
-                        size_result, dot_result, warning, raw_content = run_ocr_extraction(
-                            client, b64_string, active_model, temperature, max_tokens
+                        size_result, dot_result, warning, raw_content = (
+                            run_ocr_extraction(b64_string, temperature, max_tokens)
                         )
                         elapsed = round(time.time() - item_start, 2)
 
                         dot_date = decode_dot_date(dot_result) if dot_result else None
-                        status = "OK" if not warning else f"WARNING: {warning[:60]}"
+                        status = "OK"
                         batch_results.append(
                             {
                                 "Filename": file.name,
-                                "Extracted Size": str(size_result).upper()
-                                if size_result
-                                else "N/A",
-                                "DOT Number": str(dot_result).upper()
-                                if dot_result
-                                else "N/A",
+                                "Extracted Size": (
+                                    str(size_result).upper() if size_result else "N/A"
+                                ),
+                                "DOT Number": (
+                                    str(dot_result).upper() if dot_result else "N/A"
+                                ),
                                 "Mfg Date": dot_date if dot_date else "N/A",
                                 "Status": status,
                                 "Time (s)": elapsed,
@@ -388,54 +429,42 @@ else:
             if st.button("Run Extraction"):
                 if not api_key:
                     st.warning(
-                        "Please provide a valid OpenRouter API Key in the .env file (OPENROUTER_API_KEY)."
+                        "Please provide a valid Gemini API Key in the .env file (GEMINI_API_KEY) or Streamlit secrets."
                     )
                 else:
                     with st.spinner("Running OCR extraction..."):
                         try:
-                            client = OpenAI(
-                                api_key=api_key,
-                                base_url=OPENROUTER_BASE_URL,
-                            )
                             b64_string = encode_image_to_base64(uploaded_file)
 
                             start_time = time.time()
-                            size_result, dot_result, warning, raw_content = run_ocr_extraction(
-                                client,
-                                b64_string,
-                                active_model,
-                                temperature,
-                                max_tokens,
+                            size_result, dot_result, warning, raw_content = (
+                                run_ocr_extraction(
+                                    b64_string,
+                                    temperature,
+                                    max_tokens,
+                                )
                             )
                             elapsed = round(time.time() - start_time, 2)
 
-                            dot_date = decode_dot_date(dot_result) if dot_result else None
+                            dot_date = (
+                                decode_dot_date(dot_result) if dot_result else None
+                            )
 
                             res_col1, res_col2 = st.columns(2)
                             with res_col1:
-                                st.metric(
+                                render_scrollable_value(
                                     "Extracted Tyre Size",
                                     str(size_result).upper() if size_result else "N/A",
                                 )
                                 st.metric("Response Time", f"{elapsed}s")
                             with res_col2:
-                                dot_display = str(dot_result).upper() if dot_result else "N/A"
-                                st.markdown("**DOT Number**")
-                                st.code(dot_display, language=None)
+                                render_scrollable_value(
+                                    "DOT Number",
+                                    str(dot_result).upper() if dot_result else "N/A",
+                                )
                                 st.metric(
                                     "Manufacturing Date",
                                     dot_date if dot_date else "N/A",
-                                )
-                            if warning:
-                                st.warning(f"Parse note: {warning}")
-
-                            with st.expander(
-                                "Debug: Show raw model response", expanded=True
-                            ):
-                                st.code(
-                                    raw_content
-                                    if raw_content
-                                    else "[No content returned]"
                                 )
 
                         except Exception as e:
